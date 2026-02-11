@@ -1,232 +1,182 @@
-from __future__ import annotations
-
-from datetime import datetime, date as date_cls
+from datetime import datetime
 import csv
 import io
 
-from flask import Blueprint, request, abort, Response
-from flask_jwt_extended import create_access_token, jwt_required
-from sqlalchemy import func, and_
+from flask import Blueprint, jsonify, request, Response
+from werkzeug.security import generate_password_hash, check_password_hash
+from sqlalchemy import func
 
-from .app import db
-from .models import User, Slot, Booking, Role
-from .security import verify_password
-from .utils import current_user, require_admin
+from app import db
+from app.models import User, Slot, Prenotazione
+from app.auth import create_token, require_auth, require_admin
 
-api_bp = Blueprint("api", __name__)
+bp = Blueprint("api", __name__)
 
-def parse_date(s: str) -> date_cls:
-    try:
-        return datetime.strptime(s, "%Y-%m-%d").date()
-    except Exception:
-        abort(400, description="Invalid date (use YYYY-MM-DD)")
+def parse_date(date_str: str):
+    return datetime.strptime(date_str, "%Y-%m-%d").date()
 
-@api_bp.post("/auth/login")
+def weekday_1_to_7(d):
+    # python: Monday=0..Sunday=6
+    return d.weekday() + 1
+
+@bp.post("/auth/login")
 def login():
-    data = request.get_json(force=True, silent=True) or {}
-    username = (data.get("username") or "").strip().lower()
-    password = data.get("password") or ""
-    if not username or not password:
-        abort(400, description="Missing credentials")
+    data = request.get_json(force=True)
+    identifier = (data.get("email") or data.get("username") or "").strip().lower()
+    password = (data.get("password") or "").strip()
 
-    user = User.query.filter(func.lower(User.email) == username, User.active.is_(True)).first()
-    if not user or not verify_password(password, user.password_hash):
-        abort(401, description="Invalid credentials")
+    if not identifier or not password:
+        return jsonify({"error": "Missing credentials"}), 400
 
-    token = create_access_token(identity=str(user.id))
-    return {
-        "access_token": token,
-        "user": {
-            "id": user.id,
-            "nome": user.nome,
-            "cognome": user.cognome,
-            "gruppo": user.gruppo,
-            "role": user.role,
-            "email": user.email,
-        }
-    }
+    user = User.query.filter(func.lower(User.email) == identifier).first()
+    if not user:
+        return jsonify({"error": "Invalid credentials"}), 401
 
-@api_bp.get("/me")
-@jwt_required()
+    if not check_password_hash(user.password_hash, password):
+        return jsonify({"error": "Invalid credentials"}), 401
+
+    token = create_token(user)
+    return jsonify({"token": token, "user": user.to_safe_dict()})
+
+@bp.get("/me")
+@require_auth
 def me():
-    u = current_user()
-    return {
-        "id": u.id,
-        "nome": u.nome,
-        "cognome": u.cognome,
-        "gruppo": u.gruppo,
-        "role": u.role,
-        "email": u.email,
-    }
+    return jsonify({"user": request.user.to_safe_dict()})
 
-@api_bp.get("/slots")
-@jwt_required()
-def list_slots():
-    u = current_user()
-    date_s = request.args.get("date", "")
-    if not date_s:
-        abort(400, description="date is required")
-    d = parse_date(date_s)
-    facility = request.args.get("facility", "").strip().upper()
-    # Python weekday: Monday=0..Sunday=6 => convert to 1..7
-    dow = d.weekday() + 1
+@bp.get("/slots")
+@require_auth
+def get_slots_for_date():
+    date_str = request.args.get("date", "").strip()
+    impianto = (request.args.get("impianto") or "").strip().upper()
 
-    q = Slot.query.filter(Slot.attivo.is_(True), Slot.giorno_settimana == dow)
-    if facility:
-        q = q.filter(Slot.impianto == facility)
+    if not date_str:
+        return jsonify({"error": "Missing date"}), 400
 
-    slots = q.order_by(Slot.impianto.asc(), Slot.ora_inizio.asc()).all()
-    slot_ids = [s.id for s in slots]
-    if not slot_ids:
-        return {"date": date_s, "slots": []}
+    d = parse_date(date_str)
+    dow = weekday_1_to_7(d)
 
+    q = Slot.query.filter_by(attivo=True, giorno_settimana=dow)
+    if impianto:
+        q = q.filter(Slot.impianto == impianto)
+
+    slots = q.order_by(Slot.ora_inizio.asc()).all()
+
+    # prenotazioni per slot in quella data
     counts = dict(
-        db.session.query(Booking.slot_id, func.count(Booking.id))
-        .filter(Booking.data == d, Booking.slot_id.in_(slot_ids))
-        .group_by(Booking.slot_id)
+        db.session.query(Prenotazione.slot_id, func.count(Prenotazione.id))
+        .filter(Prenotazione.data == d)
+        .group_by(Prenotazione.slot_id)
         .all()
     )
 
-    my_bookings = set(
-        r[0] for r in db.session.query(Booking.slot_id)
-        .filter(Booking.data == d, Booking.user_id == u.id, Booking.slot_id.in_(slot_ids))
+    # prenotazioni dell'utente in quella data (per mostrare "Prenotato")
+    my_booked = set(
+        r[0] for r in db.session.query(Prenotazione.slot_id)
+        .filter(Prenotazione.data == d, Prenotazione.user_id == request.user.id)
         .all()
     )
 
-    out = []
+    result = []
     for s in slots:
         booked = int(counts.get(s.id, 0))
-        cap = s.capienza
-        remaining = None if cap is None else max(cap - booked, 0)
-        out.append({
-            "id": s.id,
-            "impianto": s.impianto,
-            "titolo": s.titolo,
-            "giorno_settimana": s.giorno_settimana,
-            "ora_inizio": s.ora_inizio,
-            "ora_fine": s.ora_fine,
-            "capienza": cap,  # null => illimitata
-            "attivo": s.attivo,
-            "prenotati": booked,
-            "rimasti": remaining,
-            "prenotato_da_me": s.id in my_bookings,
-            "pieno": False if cap is None else booked >= cap,
-        })
-    return {"date": date_s, "slots": out}
+        if s.capienza is None:
+            rimasti = None
+            pieno = False
+        else:
+            rimasti = max(s.capienza - booked, 0)
+            pieno = booked >= s.capienza
 
-@api_bp.post("/bookings")
-@jwt_required()
-def create_booking():
-    u = current_user()
-    data = request.get_json(force=True, silent=True) or {}
+        result.append({
+            **s.to_dict(),
+            "prenotati": booked,
+            "rimasti": rimasti,  # None = illimitati
+            "pieno": pieno,
+            "prenotato_da_me": (s.id in my_booked),
+        })
+
+    return jsonify({"date": date_str, "slots": result})
+
+@bp.post("/bookings")
+@require_auth
+def book():
+    data = request.get_json(force=True)
     slot_id = data.get("slot_id")
-    date_s = data.get("date")
-    if not slot_id or not date_s:
-        abort(400, description="slot_id and date required")
-    d = parse_date(date_s)
+    date_str = (data.get("date") or "").strip()
+
+    if not slot_id or not date_str:
+        return jsonify({"error": "Missing slot_id/date"}), 400
+
+    d = parse_date(date_str)
     slot = db.session.get(Slot, int(slot_id))
     if not slot or not slot.attivo:
-        abort(404, description="Slot not found or inactive")
+        return jsonify({"error": "Slot not found/inactive"}), 404
 
-    # Validate day-of-week match
-    if (d.weekday() + 1) != slot.giorno_settimana:
-        abort(400, description="Slot not available on selected date")
+    # slot valido per giorno settimana?
+    if slot.giorno_settimana != weekday_1_to_7(d):
+        return jsonify({"error": "Slot not available on this date"}), 400
 
-    # Prevent double booking by unique constraint + early check
-    existing = Booking.query.filter_by(user_id=u.id, slot_id=slot.id, data=d).first()
+    # già prenotato da me?
+    existing = Prenotazione.query.filter_by(
+        user_id=request.user.id,
+        slot_id=slot.id,
+        data=d
+    ).first()
     if existing:
-        abort(409, description="Already booked")
+        return jsonify({"error": "Already booked"}), 409
 
-    # Capacity check
+    # capienza?
     if slot.capienza is not None:
-        booked = db.session.query(func.count(Booking.id)).filter_by(slot_id=slot.id, data=d).scalar() or 0
+        booked = db.session.query(func.count(Prenotazione.id)).filter(
+            Prenotazione.slot_id == slot.id,
+            Prenotazione.data == d
+        ).scalar() or 0
+
         if booked >= slot.capienza:
-            abort(409, description="Slot full")
+            return jsonify({"error": "Full"}), 409
 
-    b = Booking(user_id=u.id, slot_id=slot.id, data=d)
+    b = Prenotazione(user_id=request.user.id, slot_id=slot.id, data=d)
     db.session.add(b)
-    try:
-        db.session.commit()
-    except Exception:
-        db.session.rollback()
-        abort(409, description="Could not book (maybe already booked)")
+    db.session.commit()
+    return jsonify({"ok": True})
 
-    return {"ok": True, "booking_id": b.id}
+@bp.delete("/bookings")
+@require_auth
+def cancel_booking():
+    data = request.get_json(force=True)
+    slot_id = data.get("slot_id")
+    date_str = (data.get("date") or "").strip()
 
-@api_bp.delete("/bookings/<int:booking_id>")
-@jwt_required()
-def delete_booking(booking_id: int):
-    u = current_user()
-    b = db.session.get(Booking, booking_id)
+    if not slot_id or not date_str:
+        return jsonify({"error": "Missing slot_id/date"}), 400
+
+    d = parse_date(date_str)
+    b = Prenotazione.query.filter_by(
+        user_id=request.user.id,
+        slot_id=int(slot_id),
+        data=d
+    ).first()
     if not b:
-        abort(404, description="Booking not found")
-    if b.user_id != u.id and not u.is_admin():
-        abort(403, description="Not allowed")
+        return jsonify({"error": "Not booked"}), 404
 
     db.session.delete(b)
     db.session.commit()
-    return {"ok": True}
-
-@api_bp.get("/bookings/my")
-@jwt_required()
-def my_bookings():
-    u = current_user()
-    date_s = request.args.get("date", "")
-    if not date_s:
-        abort(400, description="date is required")
-    d = parse_date(date_s)
-    rows = (
-        db.session.query(Booking, Slot)
-        .join(Slot, Slot.id == Booking.slot_id)
-        .filter(Booking.user_id == u.id, Booking.data == d)
-        .all()
-    )
-    out = []
-    for b, s in rows:
-        out.append({
-            "booking_id": b.id,
-            "slot_id": s.id,
-            "impianto": s.impianto,
-            "titolo": s.titolo,
-            "ora_inizio": s.ora_inizio,
-            "ora_fine": s.ora_fine,
-        })
-    return {"date": date_s, "bookings": out}
+    return jsonify({"ok": True})
 
 # ---------------- ADMIN ----------------
 
-@api_bp.get("/admin/slots")
-@jwt_required()
+@bp.get("/admin/slots")
+@require_admin
 def admin_list_slots():
-    u = current_user(); require_admin(u)
-    slots = Slot.query.order_by(Slot.impianto.asc(), Slot.giorno_settimana.asc(), Slot.ora_inizio.asc()).all()
-    return {"slots": [{
-        "id": s.id,
-        "impianto": s.impianto,
-        "titolo": s.titolo,
-        "giorno_settimana": s.giorno_settimana,
-        "ora_inizio": s.ora_inizio,
-        "ora_fine": s.ora_fine,
-        "capienza": s.capienza,
-        "attivo": s.attivo,
-    } for s in slots]}
+    slots = Slot.query.order_by(Slot.giorno_settimana.asc(), Slot.ora_inizio.asc()).all()
+    return jsonify({"slots": [s.to_dict() for s in slots]})
 
-@api_bp.post("/admin/slots")
-@jwt_required()
+@bp.post("/admin/slots")
+@require_admin
 def admin_create_slot():
-    u = current_user(); require_admin(u)
-    data = request.get_json(force=True, silent=True) or {}
-    required = ["impianto", "titolo", "giorno_settimana", "ora_inizio", "ora_fine"]
-    for k in required:
-        if not data.get(k):
-            abort(400, description=f"Missing {k}")
-    cap = data.get("capienza", None)
-    if cap in ("", None):
-        cap = None
-    else:
-        cap = int(cap)
-        if cap <= 0:
-            abort(400, description="capienza must be > 0 or null")
+    data = request.get_json(force=True)
+
+    cap = data.get("capienza")
+    capienza = None if cap in (None, "", "illimitata", "ILLIMITATA") else int(cap)
 
     s = Slot(
         impianto=str(data["impianto"]).upper(),
@@ -234,130 +184,105 @@ def admin_create_slot():
         giorno_settimana=int(data["giorno_settimana"]),
         ora_inizio=str(data["ora_inizio"]).strip(),
         ora_fine=str(data["ora_fine"]).strip(),
-        capienza=cap,
+        capienza=capienza,
         attivo=bool(data.get("attivo", True)),
     )
-    db.session.add(s); db.session.commit()
-    return {"ok": True, "id": s.id}
+    db.session.add(s)
+    db.session.commit()
+    return jsonify({"slot": s.to_dict()})
 
-@api_bp.put("/admin/slots/<int:slot_id>")
-@jwt_required()
-def admin_update_slot(slot_id: int):
-    u = current_user(); require_admin(u)
+@bp.put("/admin/slots/<int:slot_id>")
+@require_admin
+def admin_update_slot(slot_id):
     s = db.session.get(Slot, slot_id)
     if not s:
-        abort(404, description="Slot not found")
-    data = request.get_json(force=True, silent=True) or {}
+        return jsonify({"error": "Not found"}), 404
 
-    for field in ["impianto","titolo","giorno_settimana","ora_inizio","ora_fine","attivo"]:
-        if field in data:
-            if field == "impianto":
-                setattr(s, field, str(data[field]).upper())
-            elif field == "titolo":
-                setattr(s, field, str(data[field]).strip())
-            elif field == "attivo":
-                setattr(s, field, bool(data[field]))
-            elif field == "giorno_settimana":
-                setattr(s, field, int(data[field]))
-            else:
-                setattr(s, field, str(data[field]).strip())
+    data = request.get_json(force=True)
+
+    if "impianto" in data: s.impianto = str(data["impianto"]).upper()
+    if "titolo" in data: s.titolo = str(data["titolo"]).strip()
+    if "giorno_settimana" in data: s.giorno_settimana = int(data["giorno_settimana"])
+    if "ora_inizio" in data: s.ora_inizio = str(data["ora_inizio"]).strip()
+    if "ora_fine" in data: s.ora_fine = str(data["ora_fine"]).strip()
+    if "attivo" in data: s.attivo = bool(data["attivo"])
 
     if "capienza" in data:
         cap = data["capienza"]
-        if cap in ("", None):
-            s.capienza = None
-        else:
-            cap = int(cap)
-            if cap <= 0:
-                abort(400, description="capienza must be > 0 or null")
-            s.capienza = cap
+        s.capienza = None if cap in (None, "", "illimitata", "ILLIMITATA") else int(cap)
 
     db.session.commit()
-    return {"ok": True}
+    return jsonify({"slot": s.to_dict()})
 
-@api_bp.post("/admin/slots/<int:slot_id>/deactivate")
-@jwt_required()
-def admin_deactivate_slot(slot_id: int):
-    u = current_user(); require_admin(u)
-    s = db.session.get(Slot, slot_id)
-    if not s:
-        abort(404, description="Slot not found")
-    s.attivo = False
-    db.session.commit()
-    return {"ok": True}
+@bp.get("/admin/bookings")
+@require_admin
+def admin_bookings_for_slot_date():
+    date_str = request.args.get("date", "").strip()
+    slot_id = request.args.get("slot_id", "").strip()
 
-@api_bp.get("/admin/bookings")
-@jwt_required()
-def admin_list_bookings():
-    u = current_user(); require_admin(u)
-    date_s = request.args.get("date", "")
-    slot_id = request.args.get("slot_id", "")
-    if not date_s or not slot_id:
-        abort(400, description="date and slot_id required")
-    d = parse_date(date_s)
+    if not date_str or not slot_id:
+        return jsonify({"error": "Missing date/slot_id"}), 400
+
+    d = parse_date(date_str)
     slot = db.session.get(Slot, int(slot_id))
     if not slot:
-        abort(404, description="Slot not found")
+        return jsonify({"error": "Slot not found"}), 404
 
-    rows = (
-        db.session.query(User.nome, User.cognome, User.gruppo, Booking.timestamp_creazione)
-        .join(Booking, Booking.user_id == User.id)
-        .filter(Booking.slot_id == slot.id, Booking.data == d)
+    bookings = (
+        db.session.query(Prenotazione, User)
+        .join(User, User.id == Prenotazione.user_id)
+        .filter(Prenotazione.slot_id == slot.id, Prenotazione.data == d)
         .order_by(User.cognome.asc(), User.nome.asc())
         .all()
     )
-    return {
-        "date": date_s,
-        "slot": {
-            "id": slot.id,
-            "impianto": slot.impianto,
-            "titolo": slot.titolo,
-            "ora_inizio": slot.ora_inizio,
-            "ora_fine": slot.ora_fine,
-        },
-        "prenotati": [{
-            "nome": r[0],
-            "cognome": r[1],
-            "gruppo": r[2],
-            "timestamp_creazione": r[3].isoformat() if r[3] else None
-        } for r in rows]
-    }
 
-@api_bp.get("/admin/export")
-@jwt_required()
+    people = [{
+        "nome": u.nome,
+        "cognome": u.cognome,
+        "gruppo": u.gruppo,
+        "email": u.email
+    } for _, u in bookings]
+
+    return jsonify({
+        "date": date_str,
+        "slot": slot.to_dict(),
+        "prenotati": people
+    })
+
+@bp.get("/admin/export")
+@require_admin
 def admin_export_csv():
-    u = current_user(); require_admin(u)
-    date_s = request.args.get("date", "")
-    slot_id = request.args.get("slot_id", "")
-    if not date_s or not slot_id:
-        abort(400, description="date and slot_id required")
-    d = parse_date(date_s)
+    date_str = request.args.get("date", "").strip()
+    slot_id = request.args.get("slot_id", "").strip()
+
+    if not date_str or not slot_id:
+        return jsonify({"error": "Missing date/slot_id"}), 400
+
+    d = parse_date(date_str)
     slot = db.session.get(Slot, int(slot_id))
     if not slot:
-        abort(404, description="Slot not found")
+        return jsonify({"error": "Slot not found"}), 404
 
     rows = (
-        db.session.query(User.cognome, User.nome, User.gruppo, Booking.timestamp_creazione)
-        .join(Booking, Booking.user_id == User.id)
-        .filter(Booking.slot_id == slot.id, Booking.data == d)
+        db.session.query(User)
+        .join(Prenotazione, Prenotazione.user_id == User.id)
+        .filter(Prenotazione.slot_id == slot.id, Prenotazione.data == d)
         .order_by(User.cognome.asc(), User.nome.asc())
         .all()
     )
 
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["Data", date_s])
-    writer.writerow(["Impianto", slot.impianto])
-    writer.writerow(["Slot", f"{slot.titolo} {slot.ora_inizio}-{slot.ora_fine}"])
-    writer.writerow([])
-    writer.writerow(["Cognome", "Nome", "Gruppo", "Timestamp prenotazione"])
-    for c, n, g, ts in rows:
-        writer.writerow([c, n, g, ts.isoformat() if ts else ""])
+    writer.writerow(["Cognome", "Nome", "Gruppo", "Email/Username"])
+    for u in rows:
+        writer.writerow([u.cognome, u.nome, u.gruppo, u.email])
 
-    csv_bytes = output.getvalue().encode("utf-8-sig")
-    filename = f"statino_{slot.impianto}_{date_s}_{slot.id}.csv"
+    filename = f"statino_{slot.impianto}_{date_str}_slot{slot.id}.csv".replace(":", "-")
+    csv_data = output.getvalue()
+    output.close()
+
     return Response(
-        csv_bytes,
+        csv_data,
         mimetype="text/csv",
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
