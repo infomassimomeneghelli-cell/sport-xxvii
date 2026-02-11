@@ -1,131 +1,167 @@
-from __future__ import annotations
-
 import os
-import re
-import unicodedata
-from datetime import datetime
 from dotenv import load_dotenv
-import pandas as pd
+from werkzeug.security import generate_password_hash
+from openpyxl import load_workbook
 
-from app.app import create_app, db
-from app.models import User, Slot, Role
-from app.security import hash_password
+load_dotenv()
+
+from app import create_app, db
+from app.models import User, Slot
 
 DEFAULT_PASSWORD = os.getenv("DEFAULT_PASSWORD", "ChangeMe123!")
 
-def slugify(s: str) -> str:
-    s = str(s).strip().lower()
-    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
-    s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
-    return s
+EXCEL_PATH = os.path.join(os.path.dirname(__file__), "data", "ELENCO UNICO CORSO.xlsx")
+
+def slug_email(nome: str, cognome: str) -> str:
+    base = f"{nome}.{cognome}".strip().lower()
+    base = base.replace(" ", "").replace("'", "").replace("’", "")
+    base = base.replace("à","a").replace("è","e").replace("é","e").replace("ì","i").replace("ò","o").replace("ù","u")
+    return f"{base}@smam.local"
+
+def detect_columns(headers):
+    # ritorna indici colonna per nome/cognome/gruppo
+    h = [str(x).strip().lower() if x is not None else "" for x in headers]
+
+    def find_any(cands):
+        for idx, val in enumerate(h):
+            for c in cands:
+                if c in val:
+                    return idx
+        return None
+
+    col_nome = find_any(["nome"])
+    col_cognome = find_any(["cognome"])
+    # gruppo può chiamarsi anche plotone/classe ecc.
+    col_gruppo = find_any(["gruppo", "plotone", "classe"])
+    return col_nome, col_cognome, col_gruppo
+
+def load_users_from_excel(path):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Excel not found: {path}")
+
+    wb = load_workbook(path)
+    ws = wb.active
+
+    headers = [cell.value for cell in ws[1]]
+    col_nome, col_cognome, col_gruppo = detect_columns(headers)
+
+    if col_nome is None or col_cognome is None:
+        raise ValueError("Nel file Excel non trovo le colonne 'Nome' e/o 'Cognome' nella prima riga.")
+
+    users = []
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        nome = str(row[col_nome]).strip() if row[col_nome] else ""
+        cognome = str(row[col_cognome]).strip() if row[col_cognome] else ""
+        gruppo = str(row[col_gruppo]).strip() if (col_gruppo is not None and row[col_gruppo]) else ""
+
+        if not nome or not cognome:
+            continue
+
+        users.append((nome, cognome, gruppo))
+
+    return users
 
 def seed_slots():
-    # Clear existing slots
-    Slot.query.delete()
+    # PALESTRA Lun–Ven: 1)16:00-17:15 2)17:15-18:15 3)20:00-21:15 cap 30
+    for dow in [1,2,3,4,5]:
+        db.session.add(Slot(impianto="PALESTRA", titolo="1° Turno", giorno_settimana=dow,
+                            ora_inizio="16:00", ora_fine="17:15", capienza=30, attivo=True))
+        db.session.add(Slot(impianto="PALESTRA", titolo="2° Turno", giorno_settimana=dow,
+                            ora_inizio="17:15", ora_fine="18:15", capienza=30, attivo=True))
+        db.session.add(Slot(impianto="PALESTRA", titolo="3° Turno", giorno_settimana=dow,
+                            ora_inizio="20:00", ora_fine="21:15", capienza=30, attivo=True))
 
-    def add(impianto, titolo, dow, start, end, cap):
-        db.session.add(Slot(
-            impianto=impianto,
-            titolo=titolo,
-            giorno_settimana=dow,
-            ora_inizio=start,
-            ora_fine=end,
-            capienza=cap,
-            attivo=True
-        ))
+    # CAMPI Lun–Ven: 16:00–18:15 illimitata
+    for dow in [1,2,3,4,5]:
+        db.session.add(Slot(impianto="CAMPI", titolo="Unico turno", giorno_settimana=dow,
+                            ora_inizio="16:00", ora_fine="18:15", capienza=None, attivo=True))
 
-    # Palestra (Lun–Ven): 3 turni
-    for dow in range(1, 6):
-        add("PALESTRA", "1° Turno", dow, "16:00", "17:15", 30)
-        add("PALESTRA", "2° Turno", dow, "17:15", "18:15", 30)
-        add("PALESTRA", "3° Turno", dow, "20:00", "21:15", 30)
-
-    # Campi (Lun–Ven): illimitata => capienza NULL
-    for dow in range(1, 6):
-        add("CAMPI", "Unico turno", dow, "16:00", "18:15", None)
-
-    # Piscina:
-    add("PISCINA", "Turno unico", 2, "17:10", "18:00", 21)  # Martedì
-    add("PISCINA", "Turno 1", 3, "16:20", "17:10", 14)      # Mercoledì
-    add("PISCINA", "Turno 2", 3, "17:10", "18:00", 14)      # Mercoledì
-    add("PISCINA", "Turno unico", 4, "17:10", "18:00", 21)  # Giovedì
-
-def seed_users_from_excel(excel_path: str):
-    df = pd.read_excel(excel_path)
-
-    # Expect the provided format: 4 useful columns with header "Unnamed: ..."
-    df = df[df[df.columns[0]].notna()].copy()
-    df.columns = ["idx", "gruppo", "cognome", "nome", *df.columns[4:]]
-    df = df[["gruppo", "cognome", "nome"]]
-
-    # Clear existing users
-    User.query.delete()
-
-    seen = set()
-    for _, r in df.iterrows():
-        gruppo = str(r["gruppo"]).strip()
-        cognome = str(r["cognome"]).strip()
-        nome = str(r["nome"]).strip()
-
-        base = f"{slugify(nome)}.{slugify(cognome)}"
-        username = base
-        i = 2
-        while username in seen:
-            username = f"{base}{i}"
-            i += 1
-        seen.add(username)
-        email = f"{username}@smam.local"
-
-        role = Role.USER.value
-        if cognome.upper() == "MENEGHELLI" and nome.upper() == "MASSIMO":
-            role = Role.ADMIN.value
-
-        db.session.add(User(
-            nome=nome.title(),
-            cognome=cognome.title(),
-            gruppo=gruppo,
-            role=role,
-            email=email.lower(),
-            password_hash=hash_password(DEFAULT_PASSWORD),
-            active=True
-        ))
+    # PISCINA:
+    # Martedì 17:10–18:00 cap 21 (dow=2)
+    db.session.add(Slot(impianto="PISCINA", titolo="Turno", giorno_settimana=2,
+                        ora_inizio="17:10", ora_fine="18:00", capienza=21, attivo=True))
+    # Mercoledì 16:20–17:10 cap 14 (dow=3)
+    db.session.add(Slot(impianto="PISCINA", titolo="Turno 1", giorno_settimana=3,
+                        ora_inizio="16:20", ora_fine="17:10", capienza=14, attivo=True))
+    # Mercoledì 17:10–18:00 cap 14 (dow=3)
+    db.session.add(Slot(impianto="PISCINA", titolo="Turno 2", giorno_settimana=3,
+                        ora_inizio="17:10", ora_fine="18:00", capienza=14, attivo=True))
+    # Giovedì 17:10–18:00 cap 21 (dow=4)
+    db.session.add(Slot(impianto="PISCINA", titolo="Turno", giorno_settimana=4,
+                        ora_inizio="17:10", ora_fine="18:00", capienza=21, attivo=True))
 
 def ensure_single_admin():
-    admins = User.query.filter_by(role=Role.ADMIN.value).all()
-    if not admins:
-        raise RuntimeError("No ADMIN user found (expected Meneghelli Massimo).")
-    if len(admins) > 1:
-        raise RuntimeError(f"More than one ADMIN found ({len(admins)}). This is not allowed.")
+    # forza: solo Meneghelli Massimo (ATLA)
+    admin_nome = "Massimo"
+    admin_cognome = "Meneghelli"
+    admin_gruppo = "ATLA"
+    admin_email = slug_email(admin_nome, admin_cognome)
 
-if __name__ == "__main__":
-    load_dotenv()
+    # tutti gli altri -> USER
+    User.query.update({User.ruolo: "USER"})
+    db.session.flush()
+
+    admin = User.query.filter_by(email=admin_email).first()
+    if not admin:
+        admin = User(
+            nome=admin_nome,
+            cognome=admin_cognome,
+            gruppo=admin_gruppo,
+            ruolo="ADMIN",
+            email=admin_email,
+            password_hash=generate_password_hash(DEFAULT_PASSWORD),
+        )
+        db.session.add(admin)
+    else:
+        admin.nome = admin_nome
+        admin.cognome = admin_cognome
+        admin.gruppo = admin_gruppo
+        admin.ruolo = "ADMIN"
+        # non tocchiamo password se già esiste
+    db.session.flush()
+
+def main():
     app = create_app()
     with app.app_context():
-        db.drop_all()
         db.create_all()
 
-        # Seed slots
-        seed_slots()
+        # Seed slots solo se non esistono
+        if Slot.query.count() == 0:
+            seed_slots()
 
-        # Seed users
-        excel_path = os.path.join(os.path.dirname(__file__), "data", "ELENCO UNICO CORSO.xlsx")
-        if os.path.exists(excel_path):
-            seed_users_from_excel(excel_path)
-        else:
-            # Minimal fallback: only admin
-            db.session.add(User(
-                nome="Massimo",
-                cognome="Meneghelli",
-                gruppo="ATLA",
-                role=Role.ADMIN.value,
-                email="meneghelli.massimo@smam.local",
-                password_hash=hash_password(DEFAULT_PASSWORD),
-                active=True
-            ))
+        # Import utenti Excel (aggiunge solo quelli mancanti)
+        imported = 0
+        try:
+            rows = load_users_from_excel(EXCEL_PATH)
+        except Exception as e:
+            print(f"[WARN] Impossibile importare utenti da Excel: {e}")
+            rows = []
 
-        db.session.commit()
+        for nome, cognome, gruppo in rows:
+            email = slug_email(nome, cognome)
+            exists = User.query.filter_by(email=email).first()
+            if exists:
+                # aggiorno campi base senza toccare password
+                exists.nome = nome
+                exists.cognome = cognome
+                exists.gruppo = gruppo
+                continue
+
+            u = User(
+                nome=nome,
+                cognome=cognome,
+                gruppo=gruppo,
+                ruolo="USER",
+                email=email,
+                password_hash=generate_password_hash(DEFAULT_PASSWORD),
+            )
+            db.session.add(u)
+            imported += 1
+
         ensure_single_admin()
 
-        print("✅ DB initialized.")
-        print(f"✅ Seeded users: {User.query.count()} (DEFAULT_PASSWORD={DEFAULT_PASSWORD})")
-        print(f"✅ Seeded slots: {Slot.query.count()}")
+        db.session.commit()
+        print(f"[OK] DB ready. Imported new users: {imported}. Slots: {Slot.query.count()}, Users: {User.query.count()}")
+
+if __name__ == "__main__":
+    main()
