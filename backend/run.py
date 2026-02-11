@@ -1,11 +1,13 @@
-from __future__ import annotations
 import os
 from dotenv import load_dotenv
-from app.app import create_app
 
 load_dotenv()
+
+from app import create_app
 
 app = create_app()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+    # Render usa gunicorn, ma in locale va bene così
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=True)
